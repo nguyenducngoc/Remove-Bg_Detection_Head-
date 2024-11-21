@@ -15,6 +15,10 @@ from isnet import ISNetDIS
 import sys
 import time
 import tensorflow as tf
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from mediapipe.framework.formats import landmark_pb2
 
 from myFROZEN_GRAPH_HEAD import FROZEN_GRAPH_HEAD
 
@@ -23,6 +27,26 @@ from data_loader_cache import normalize, im_reader, im_preprocess
 #Helpers
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+def create_face_outline(image, face_landmarks):
+    FACE_OUTLINE_INDICES = [
+        10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400,
+        377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67,
+        109, 10
+    ]
+    
+    points = []
+    height, width = image.shape[:2]
+    
+    # Lấy tọa độ các điểm cho đường viền
+    for idx in FACE_OUTLINE_INDICES:
+        landmark = face_landmarks[idx]
+        x = int(landmark.x * width)
+        y = int(landmark.y * height)
+        points.append([x, y])
+    
+    points = np.array(points, dtype=np.int32)
+    
+    return points
     
 class GOSNormalize(object):
 
@@ -84,7 +108,6 @@ def predict(net,  inputs_val, shapes_val, hypar, device):
 
     ## recover the prediction spatial size to the orignal image size
     pred_val = torch.squeeze(F.upsample(torch.unsqueeze(pred_val,0),(shapes_val[0][0],shapes_val[0][1]),mode='bilinear'))
-
     ma = torch.max(pred_val)
     mi = torch.min(pred_val)
     pred_val = (pred_val-mi)/(ma-mi) # max = 1
@@ -119,17 +142,78 @@ net = build_model(hypar, device)
 PATH_TO_CKPT_HEAD = 'HEAD_DETECTION_300x300_ssd_mobilenetv2.pb'
 head_detector = FROZEN_GRAPH_HEAD(PATH_TO_CKPT_HEAD)
 
-def inference(image):
-    image_path = image
+def process_image(image_path):
+    base_options = python.BaseOptions(model_asset_path='face_landmarker_v2_with_blendshapes.task')
+    options = vision.FaceLandmarkerOptions(base_options=base_options,
+                                         num_faces=1)
+    detector = vision.FaceLandmarker.create_from_options(options)
     
+    image = cv2.imread(image_path)
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+    detection_result = detector.detect(mp_image)
+    
+    if detection_result.face_landmarks:
+        face_outline = create_face_outline(image, detection_result.face_landmarks[0])
+        result = np.zeros_like(image)
+        cv2.fillPoly(result, [face_outline], (255, 255, 255))
+        result = cv2.bitwise_and(image, result)
+        result = Image.fromarray(result).convert('RGB')
+        result = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
+        
+        return result
+
+def save_transparent_image(image, save_path):
+    """
+    Lưu ảnh với nền trong suốt
+    
+    Parameters:
+    - image: Ảnh đầu vào (numpy array)
+    - save_path: Đường dẫn lưu file
+    """
+    # Tạo thư mục nếu chưa tồn tại
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    
+    # Kiểm tra xem ảnh có kênh alpha chưa
+    if image.shape[-1] == 3:
+        # Nếu ảnh có 3 kênh (BGR), thêm kênh alpha
+        b, g, r = cv2.split(image)
+        alpha = np.ones(b.shape, dtype=b.dtype) * 255
+        image = cv2.merge((b, g, r, alpha))
+    elif image.shape[-1] == 4:
+        # Chuyển từ RGBA sang BGRA
+        image = cv2.cvtColor(image, cv2.COLOR_RGBA2BGRA)
+    
+    cv2.imwrite(save_path, image, [cv2.IMWRITE_PNG_COMPRESSION, 9])
+
+def putal_image(image):
+    image_path = image
     image_tensor, orig_size = load_image(image_path, hypar) 
     mask = predict(net, image_tensor, orig_size, hypar, device)
-    
     pil_mask = Image.fromarray(mask).convert('L')
     im_rgb = Image.open(image).convert("RGB")
-    
     im_rgba = im_rgb.copy()
     im_rgba.putalpha(pil_mask)
+    
+    return im_rgba
+
+def save_mark(save_path, image):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    im_crop_array = np.array(image)
+    rgb = cv2.cvtColor(im_crop_array, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(save_path, rgb)
+
+def inference(image):
+    #save
+    save_path_crop = 'Remove-Bg/crop_transparent.png'
+    save_path_mark = 'Remove-Bg/mark_transparent.png'
+    save_path_final = 'Remove-Bg/final_transparent.png'
+    save_test = 'Remove-Bg/test.png'
+    save_test_mark = 'Remove-Bg/test_mark.png'
+
+    im_rgba = putal_image(image)
     
     im_array = np.array(im_rgba)
     im_height, im_width = im_array.shape[:2]
@@ -139,7 +223,7 @@ def inference(image):
     if heads:
         total_height = sum(head['height'] for head in heads)
         max_width = max(head['width'] for head in heads)
-        combined_crop = Image.new('RGBA', (max_width, total_height))
+        combined_crop = Image.new('RGBA', (max_width, total_height), (0, 0, 0, 0))
         
         y_offset = 0
         for head in heads:
@@ -148,28 +232,70 @@ def inference(image):
             right = head['right']
             bottom = head['bottom']
             
-            # Crop from im_rgba
             head_crop = im_rgba.crop((left, top, right, bottom))
-            
-            # Paste onto combined image
-            combined_crop.paste(head_crop, (0, y_offset))
-            y_offset += head['height']
-            
+            head_crop_array = np.array(head_crop)
+            alpha_channel = head_crop_array[:, :, 3]
+
+            if not np.all(alpha_channel == 0):
+                combined_crop.paste(head_crop, (0, y_offset), head_crop)
+                y_offset += head['height']
         im_crop_pil = combined_crop
-    else:
- 
-        im_crop_pil = Image.new('RGBA', (100, 100), (0, 0, 0, 0))
+    #save crop
+    im_crop_array = np.array(im_crop_pil)
+    save_transparent_image(im_crop_array, save_path_crop)
+    
+    image_face = process_image(save_path_crop)
 
-    return [im_rgba, pil_mask, im_crop_pil]
+    save_path1 = 'Remove-Bg/mark.png'
+    save_mark(save_path1, image_face)
 
+    im_face_pil = putal_image(save_path1)
+    im_face_array = np.array(im_face_pil)
+    save_transparent_image(im_face_array, save_test)
+    #bg
+    image_1 = cv2.imread(save_path_crop)
+
+    if image_1.shape[-1] != 4:
+        b, g, r = cv2.split(image_1)
+        alpha = np.ones(b.shape, dtype=b.dtype) * 255
+        image_1 = cv2.merge((b, g, r, alpha))
+    
+    cut_percentage = 30
+    height = image_1.shape[0]
+    cut_height = int(height *(cut_percentage/100))
+
+    image_1[height - cut_height:, :, 3] = 0
+    
+    save_transparent_image(image_1, save_path_mark)
+    
+    # im_head = putal_image(save_path_mark)
+    # image = Image.open(save_path_mark)
+    # background = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    
+    background = Image.open(save_path_mark).convert('RGBA')
+    # background = cv2.cvtColor(background, cv2.COLOR_BGR2RGB)
+    overlay = Image.open(save_test)
+    overlay_sub = overlay.convert('RGBA')
+    data = np.array(overlay_sub)
+    r, g, b, a = data.T
+    data = np.array([b, g, r, a])
+    data = data.transpose()
+    overlay_sub = Image.fromarray(data)
+    
+    result = Image.alpha_composite(overlay_sub, background)
+    result.save(save_test_mark)
+    
+    image = cv2.imread(save_test_mark)
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    return image
 
 interface = gr.Interface(
     fn=inference,
     inputs=gr.Image(type='filepath'),
     outputs=[
-        gr.Image(type='filepath', format="png"),  # im_rgba - masked image
-        gr.Image(type='filepath', format="png"),  # pil_mask - alpha mask
-        gr.Image(type='filepath', format="png")   # im_crop_pil - cropped heads from im_rgba
+        gr.Image(type='filepath', format="png"),  # im_crop_pil - cropped heads from im_rgba
+        # gr.Image(type='filepath', format="png"),  # image_face
+        # gr.Image(type='filepath', format="png")   # final overlaid image
     ],
     flagging_mode="never",
     cache_mode="lazy",
